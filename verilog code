@@ -1,0 +1,235 @@
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// File: function_unit.v (for LE F.1)
+// Description: 16-bit Function Unit expanded directly from LE C.2 / C.3.
+// Implements 13 operations (mova, add, sub, decA, negA, incB,
+// or, notA, notB, lslB, rem16, mod8, lsrB) and status bits V, C, N, Z.
+//
+////////////////////////////////////////////////////////////////////////////////////////////////////
+module function_unit(FS, OpA, OpB, result, V, C, N, Z);
+	input   [3:0] FS;				// Function Unit select code.
+   input  [15:0] OpA;				// Function Unit operand A
+   input  [15:0] OpB;				// Function Unit operand B
+   output [15:0] result;		// Function Unit result
+   output        V;				// Overflow status bit
+   output        C;				// Carry-out status bit
+   output        N;				// Negative status bit
+   output        Z;				// Zero status bit
+
+// 1. Subcircuit Instantiations (3 Functional Blocks expanded to 16-bit)
+    wire [15:0] res_arith;
+    wire        v_arith, c_arith;
+    arith_circuit_16bit b_arith (res_arith, v_arith, c_arith, OpA, OpB, FS[2:0]);
+
+    wire [15:0] res_logic;
+    logic_circuit_16bit b_logic (res_logic, OpA, OpB, FS[1:0]);
+
+    wire [15:0] res_special;
+    special_circuit_16bit b_special (res_special, OpB, FS[1:0]);
+
+    // 2. High-Level Block Selection Logic
+    wire fs3_n, fs2_n, fs1_n, fs0_n;
+    not inv_fs3 (fs3_n, FS[3]);
+    not inv_fs2 (fs2_n, FS[2]);
+    not inv_fs1 (fs1_n, FS[1]);
+    not inv_fs0 (fs0_n, FS[0]);
+
+    // Arithmetic block is valid when FS[3] == 0 and FS[2:0] <= 5
+    wire not_fs2_or_not_fs1;
+    wire arith_valid;
+    or  g_ar_or  (not_fs2_or_not_fs1, fs2_n, fs1_n);
+    and g_ar_val (arith_valid, fs3_n, not_fs2_or_not_fs1);
+
+    // Logic block is valid when FS[3:2] == 2'b10
+    wire sel_logic;
+    and g_sel_log (sel_logic, FS[3], fs2_n);
+
+    // Special block is valid when FS[3:2] == 2'b11 and FS[1:0] != 2'b11
+    wire special_valid, sel_special;
+    nand g_sp_val (special_valid, FS[1], FS[0]);
+    and  g_sel_sp (sel_special, FS[3], FS[2], special_valid);
+
+    // Multiplex final 16-bit result across all 3 functional blocks
+    assign result = (res_arith   & {16{arith_valid}}) |
+                    (res_logic   & {16{sel_logic}})   |
+                    (res_special & {16{sel_special}});
+
+    // 3. Status Bits (V, C, N, Z) Logic
+    wire is_mova_top;
+    and g_mova_top (is_mova_top, fs3_n, fs2_n, fs1_n, fs0_n);
+    assign V = v_arith & arith_valid & ~is_mova_top;
+    assign C = c_arith & arith_valid & ~is_mova_top;
+
+    // Both shift operations (lslB: 1011 and lsrB: 1110) clear ALL status bits
+    wire is_lslB, is_lsrB, clear_status;
+    and g_lslB (is_lslB, FS[3], fs2_n, FS[1], FS[0]);
+    and g_lsrB (is_lsrB, FS[3], FS[2], FS[1], fs0_n);
+    or  g_clr  (clear_status, is_lslB, is_lsrB);
+
+    // Negative (N): MSB of active result, forced to 0 if clear_status is asserted
+    assign N = result[15] & ~clear_status;
+
+    // Zero (Z): 1 when all 16 bits of result are 0, forced to 0 if clear_status is asserted
+    wire result_is_zero;
+    assign result_is_zero = ~(result[15] | result[14] | result[13] | result[12] |
+                              result[11] | result[10] | result[9]  | result[8]  |
+                              result[7]  | result[6]  | result[5]  | result[4]  |
+                              result[3]  | result[2]  | result[1]  | result[0]);
+    assign Z = result_is_zero & ~clear_status;
+
+endmodule
+
+
+// ============================================================================
+// Submodule 1: arith_circuit_16bit
+// ============================================================================
+module arith_circuit_16bit (result, V, C, OpA, OpB, opselect);
+    input  [2:0]  opselect;
+    input  [15:0] OpA, OpB;
+    output [15:0] result;
+    output        V, C;
+
+    wire s2_n, s1_n, s0_n;
+    not inv_s2 (s2_n, opselect[2]);
+    not inv_s1 (s1_n, opselect[1]);
+    not inv_s0 (s0_n, opselect[0]);
+
+    wire is_mova, is_add, is_sub, is_decA, is_negA, is_incB;
+    and g_mova (is_mova, s2_n,        s1_n,        s0_n);
+    and g_add  (is_add,  s2_n,        s1_n,        opselect[0]);
+    and g_sub  (is_sub,  s2_n,        opselect[1], s0_n);
+    and g_decA (is_decA, s2_n,        opselect[1], opselect[0]);
+    and g_negA (is_negA, opselect[2], s1_n,        s0_n);
+    and g_incB (is_incB, opselect[2], s1_n,        opselect[0]);
+
+    wire c0;
+    or g_c0 (c0, is_sub, is_negA, is_incB);
+
+    wire sel_opA_x;
+    or g_sel_x (sel_opA_x, is_mova, is_add, is_sub, is_decA);
+    wire [15:0] X;
+    assign X = OpA & {16{sel_opA_x}};
+
+    wire [15:0] notB, notA;
+    assign notB = ~OpB;
+    assign notA = ~OpA;
+
+    wire [15:0] Y;
+    assign Y = (OpB      & {16{is_add | is_incB}}) |
+               (notB     & {16{is_sub}})           |
+               (notA     & {16{is_negA}})          |
+               (16'hFFFF & {16{is_decA}});
+
+    wire [15:0] c_wire;
+    full_adder_1bit fa0  (result[0],  c_wire[0],  X[0],  Y[0],  c0);
+    full_adder_1bit fa1  (result[1],  c_wire[1],  X[1],  Y[1],  c_wire[0]);
+    full_adder_1bit fa2  (result[2],  c_wire[2],  X[2],  Y[2],  c_wire[1]);
+    full_adder_1bit fa3  (result[3],  c_wire[3],  X[3],  Y[3],  c_wire[2]);
+    full_adder_1bit fa4  (result[4],  c_wire[4],  X[4],  Y[4],  c_wire[3]);
+    full_adder_1bit fa5  (result[5],  c_wire[5],  X[5],  Y[5],  c_wire[4]);
+    full_adder_1bit fa6  (result[6],  c_wire[6],  X[6],  Y[6],  c_wire[5]);
+    full_adder_1bit fa7  (result[7],  c_wire[7],  X[7],  Y[7],  c_wire[6]);
+    full_adder_1bit fa8  (result[8],  c_wire[8],  X[8],  Y[8],  c_wire[7]);
+    full_adder_1bit fa9  (result[9],  c_wire[9],  X[9],  Y[9],  c_wire[8]);
+    full_adder_1bit fa10 (result[10], c_wire[10], X[10], Y[10], c_wire[9]);
+    full_adder_1bit fa11 (result[11], c_wire[11], X[11], Y[11], c_wire[10]);
+    full_adder_1bit fa12 (result[12], c_wire[12], X[12], Y[12], c_wire[11]);
+    full_adder_1bit fa13 (result[13], c_wire[13], X[13], Y[13], c_wire[12]);
+    full_adder_1bit fa14 (result[14], c_wire[14], X[14], Y[14], c_wire[13]);
+    full_adder_1bit fa15 (result[15], c_wire[15], X[15], Y[15], c_wire[14]);
+
+    assign C = c_wire[15];
+    xor g_ovf (V, c_wire[15], c_wire[14]);
+
+endmodule
+
+
+// ============================================================================
+// Submodule 2: logic_circuit_16bit
+// ============================================================================
+module logic_circuit_16bit (result, OpA, OpB, opselect);
+    input  [1:0]  opselect;
+    input  [15:0] OpA, OpB;
+    output [15:0] result;
+
+    wire s1_n, s0_n;
+    not inv_s1 (s1_n, opselect[1]);
+    not inv_s0 (s0_n, opselect[0]);
+
+    wire sel_or, sel_notA, sel_notB, sel_lslB;
+    and g_or   (sel_or,   s1_n,        s0_n);
+    and g_notA (sel_notA, s1_n,        opselect[0]);
+    and g_notB (sel_notB, opselect[1], s0_n);
+    and g_lslB (sel_lslB, opselect[1], opselect[0]);
+
+    wire [15:0] res_or;
+    wire [15:0] res_notA;
+    wire [15:0] res_notB;
+    wire [15:0] res_lslB;
+
+    assign res_or   = OpA | OpB;
+    assign res_notA = ~OpA;
+    assign res_notB = ~OpB;
+    assign res_lslB = {OpB[14:0], 1'b0};
+
+    assign result = (res_or   & {16{sel_or}})   |
+                    (res_notA & {16{sel_notA}}) |
+                    (res_notB & {16{sel_notB}}) |
+                    (res_lslB & {16{sel_lslB}});
+
+endmodule
+
+
+// ============================================================================
+// Submodule 3: special_circuit_16bit
+// ============================================================================
+module special_circuit_16bit (result, OpB, opselect);
+    input  [1:0]  opselect;
+    input  [15:0] OpB;
+    output [15:0] result;
+
+    wire s1_n, s0_n;
+    not inv_s1 (s1_n, opselect[1]);
+    not inv_s0 (s0_n, opselect[0]);
+
+    wire sel_rem16, sel_mod8, sel_lsrB;
+    and g_rem16 (sel_rem16, s1_n,        s0_n);
+    and g_mod8  (sel_mod8,  s1_n,        opselect[0]);
+    and g_lsrB  (sel_lsrB,  opselect[1], s0_n);
+
+    wire lower4_has_ones;
+    assign lower4_has_ones = OpB[3] | OpB[2] | OpB[1] | OpB[0];
+    wire rem_sign_bit;
+    assign rem_sign_bit = OpB[15] & lower4_has_ones;
+    wire [15:0] res_rem16;
+    assign res_rem16 = {{12{rem_sign_bit}}, OpB[3:0]};
+
+    wire [15:0] res_mod8;
+    assign res_mod8 = {13'b0000000000000, OpB[2:0]};
+
+    wire [15:0] res_lsrB;
+    assign res_lsrB = {1'b0, OpB[15:1]};
+
+    assign result = (res_rem16 & {16{sel_rem16}}) |
+                    (res_mod8  & {16{sel_mod8}})  |
+                    (res_lsrB  & {16{sel_lsrB}});
+
+endmodule
+
+
+// ============================================================================
+// Submodule 4: full_adder_1bit
+// ============================================================================
+module full_adder_1bit (s, cout, a, b, cin);
+    input  a, b, cin;
+    output s, cout;
+
+    wire w1, w2, w3;
+    xor g_xor1 (w1, a, b);
+    xor g_xor2 (s, w1, cin);
+
+    and g_and1 (w2, w1, cin);
+    and g_and2 (w3, a, b);
+    or  g_or1  (cout, w2, w3);
+
+endmodule
